@@ -1,11 +1,12 @@
 """Organisation-scoped Snapshot orchestration."""
 
+import logging
 from datetime import datetime, timezone
 
 from . import organisation_engine as organisation
 from . import site_engine as site_engine
 from .source import SourceRange, fetch_events
-from .storage import ConcurrentSnapshotUpdate, connection, credentials, load_context, persist
+from .storage import ConcurrentSnapshotUpdate, MissingPrerequisite, load_context, persist
 
 MAX_RETRIES = 2
 
@@ -138,34 +139,31 @@ def _run_attempt(sql_connection, organisation_id, bq_client, snapshot_now):
     return True
 
 
+def run_on_connection(sql_connection, organisation_id, bq_client, snapshot_now):
+    """Execute using the caller's locked physical session; never reconnect."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return _run_attempt(sql_connection, organisation_id, bq_client, snapshot_now)
+        except MissingPrerequisite as exc:
+            sql_connection.rollback()
+            logging.getLogger(__name__).info(
+                "snapshot_skipped organisation_id=%s reason=%s", organisation_id, exc.reason)
+            return False
+        except ConcurrentSnapshotUpdate:
+            sql_connection.rollback()
+            if attempt == MAX_RETRIES:
+                raise RuntimeError(
+                    f"Snapshot update repeatedly conflicted for organisation_id={organisation_id}") from None
+
+
 def Snapshot(organisation_id):
-    """Advance all required site snapshots and one organisation snapshot atomically."""
-    from google.cloud.sql.connector import Connector
+    """Synchronous, guarded Snapshot. False only for missing prerequisites.
 
-    snapshot_now = _now()
-    snapshot_credentials = credentials()
-    connector = Connector(credentials=snapshot_credentials)
-    client = None
-
-    def bq_client():
-        nonlocal client
-        if client is None:
-            from google.cloud import bigquery
-            client = bigquery.Client(credentials=snapshot_credentials,
-                                     project=snapshot_credentials.project_id)
-        return client
-
-    try:
-        with connection(connector, snapshot_credentials) as sql_connection:
-            for attempt in range(MAX_RETRIES + 1):
-                try:
-                    return _run_attempt(
-                        sql_connection, organisation_id, bq_client, snapshot_now
-                    )
-                except ConcurrentSnapshotUpdate:
-                    sql_connection.rollback()
-                    if attempt == MAX_RETRIES:
-                        raise RuntimeError(f"Snapshot update repeatedly conflicted for organisation_id={organisation_id}") from None
-    finally:
-        connector.close()
-
+    Direct calls preserve the original no-cooldown execution contract. HTTP task
+    admission applies cooldown separately on the same physical connection.
+    """
+    from snapshot_worker import process
+    outcome = process(organisation_id, cooldown=False)
+    if outcome.status == "busy":
+        raise RuntimeError("Snapshot already running")
+    return outcome.success

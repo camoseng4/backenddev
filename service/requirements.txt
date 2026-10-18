@@ -1,0 +1,7 @@
+-c requirements.lock
+Flask==3.1.2
+gunicorn==23.0.0
+google-auth==2.62.0
+google-cloud-bigquery==3.46.2
+cloud-sql-python-connector[pg8000]==1.23.0
+pg8000==1.31.5

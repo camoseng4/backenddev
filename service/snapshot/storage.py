@@ -2,7 +2,9 @@
 
 import json
 from contextlib import contextmanager
-from pathlib import Path
+from contextlib import closing
+
+from config import Settings
 
 from .site_engine import stamp
 
@@ -15,22 +17,77 @@ class ConcurrentSnapshotUpdate(RuntimeError):
     pass
 
 
-def credentials():
-    from google.oauth2 import service_account
+class MissingPrerequisite(Exception):
+    """An intentional skip, never a database/credential/calculation failure."""
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
 
-    path = Path(__file__).with_name("sa.json")
-    return service_account.Credentials.from_service_account_file(str(path))
+
+def check_prerequisites(connection, organisation_id):
+    """Read-only preflight before interpreting state or doing any calculation."""
+    with closing(connection.cursor()) as cursor:
+        cursor.execute("SELECT id FROM public.organisations WHERE id=%s", (organisation_id,))
+        if cursor.fetchone() is None:
+            raise MissingPrerequisite("organisation_missing")
+        cursor.execute("SELECT id FROM public.sites WHERE organisation_id=%s ORDER BY id", (organisation_id,))
+        site_ids = [int(row[0]) for row in cursor.fetchall()]
+        if not site_ids:
+            raise MissingPrerequisite("no_sites")
+        cursor.execute("SELECT ts FROM public.organisation_snapshots WHERE organisation_id=%s", (organisation_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise MissingPrerequisite("organisation_snapshot_missing")
+        timestamp = row[0]
+        cursor.execute("SELECT site_id FROM public.site_snapshots WHERE site_id = ANY(%s)", (site_ids,))
+        if set(site_ids) - {int(row[0]) for row in cursor.fetchall()}:
+            raise MissingPrerequisite("site_snapshot_missing")
+        return timestamp
+
+
+def credentials():
+    import google.auth
+    return google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])[0]
 
 
 @contextmanager
-def connection(connector, snapshot_credentials):
-    email = snapshot_credentials.service_account_email
+def runtime(settings):
+    """One physical SQL session per execution. No pool, reconnect or JSON key."""
+    from google.cloud.sql.connector import Connector
+    from google.cloud import bigquery
+    snapshot_credentials = credentials()
+    client = None
+    connector = Connector(credentials=snapshot_credentials, refresh_strategy="lazy")
+    try:
+        with connection(connector, snapshot_credentials, settings) as sql:
+            def bq_factory():
+                nonlocal client
+                if client is None:
+                    client = bigquery.Client(credentials=snapshot_credentials,
+                                             project=settings.project,
+                                             location=settings.bigquery_location)
+                return client
+            yield sql, bq_factory
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            connector.close()
+
+
+@contextmanager
+def connection(connector, snapshot_credentials, settings=None):
+    from google.cloud.sql.connector import IPTypes
+    settings = settings or Settings.from_env()
+    # ADC metadata email may be unresolved before refresh. Use explicit identity;
+    # Connector authenticates the actual ADC principal, so a mismatch fails closed.
+    email = settings.service_account
     value = connector.connect(
-        INSTANCE,
-        "pg8000",
-        user=email.removesuffix(".gserviceaccount.com"),
-        db=DATABASE,
-        enable_iam_auth=True,
+        settings.instance, "pg8000",
+        user=email.removesuffix(".gserviceaccount.com"), db=settings.database,
+        enable_iam_auth=True, ip_type=getattr(IPTypes, settings.ip_type),
+        timeout=30,
     )
     try:
         yield value
@@ -45,6 +102,7 @@ def _json(value):
 
 
 def load_context(connection, organisation_id):
+    check_prerequisites(connection, organisation_id)
     cursor = connection.cursor()
     try:
         cursor.execute(
@@ -53,7 +111,7 @@ def load_context(connection, organisation_id):
         )
         row = cursor.fetchone()
         if row is None:
-            raise ValueError(f"Snapshot organisation not found: {organisation_id}")
+            raise MissingPrerequisite("organisation_missing")
         organisation = {
             "id": int(row[0]),
             "enabled": bool(row[1]),
@@ -75,6 +133,8 @@ def load_context(connection, organisation_id):
             }
             for row in cursor.fetchall()
         ]
+        if not sites:
+            raise MissingPrerequisite("no_sites")
         site_ids = [site["id"] for site in sites]
         devices_by_site = {site_id: [] for site_id in site_ids}
         if site_ids:
@@ -114,7 +174,7 @@ def load_context(connection, organisation_id):
             site_rows = {}
         missing = sorted(set(site_ids) - set(site_rows))
         if missing:
-            raise ValueError(f"Missing provisioned site_snapshots rows: {missing}")
+            raise MissingPrerequisite("site_snapshot_missing")
 
         cursor.execute(
             "SELECT organisation_id,ts,state,updated_at "
@@ -123,7 +183,7 @@ def load_context(connection, organisation_id):
         )
         row = cursor.fetchone()
         if row is None:
-            raise ValueError(f"Missing provisioned organisation_snapshots row: {organisation_id}")
+            raise MissingPrerequisite("organisation_snapshot_missing")
         org_row = {
             "organisation_id": int(row[0]),
             "ts": stamp(row[1]),

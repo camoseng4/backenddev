@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.json
+*.pem
+*.key
+.env*
+tests
